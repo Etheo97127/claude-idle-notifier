@@ -36,14 +36,15 @@ function Get-WatcherCommandLine {
     return "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watcher`"$homeArg"
 }
 
+# Always call as @(Get-WatcherProcesses): a single CimInstance returned bare has no usable .Count.
 function Get-WatcherProcesses {
     $needle = (Join-Path $NotifierHome 'watcher.ps1').ToLower()
-    @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-        Where-Object { $_.CommandLine -and $_.CommandLine.ToLower().Contains($needle) })
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+        Where-Object { $_.CommandLine -and $_.CommandLine.ToLower().Contains($needle) }
 }
 
 function Start-Watcher {
-    $running = Get-WatcherProcesses
+    $running = @(Get-WatcherProcesses)
     if ($running.Count) { Write-Host "Watcher already running (pid $($running[0].ProcessId))."; return }
     $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
@@ -56,19 +57,20 @@ function Start-Watcher {
         $started = ($r.ReturnValue -eq 0)
     } catch { }
     if (-not $started) { Start-Process -FilePath $conhost -ArgumentList ('--headless "' + $ps + '" ' + (Get-WatcherCommandLine)) -WindowStyle Hidden }
-    for ($i = 0; $i -lt 20; $i++) {
-        Start-Sleep -Milliseconds 250
-        $running = Get-WatcherProcesses
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)   # PowerShell can take several seconds to start on a busy machine
+    while ([DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        $running = @(Get-WatcherProcesses)
         if ($running.Count) { Write-Host "Watcher started (pid $($running[0].ProcessId))."; return }
     }
-    Write-Warning "Watcher did not start - see $LogPath"
+    Write-Warning "Watcher did not start within 20 s - check 'claude-idle status' or $LogPath"
 }
 
-function Stop-Watcher {
-    $running = Get-WatcherProcesses
-    if (-not $running.Count) { Write-Host 'Watcher is not running.'; return }
+function Stop-Watcher([switch]$Quiet) {
+    $running = @(Get-WatcherProcesses)
+    if (-not $running.Count) { if (-not $Quiet) { Write-Host 'Watcher is not running.' }; return }
     foreach ($p in $running) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
-    Write-Host "Watcher stopped."
+    if (-not $Quiet) { Write-Host 'Watcher stopped.' }
 }
 
 # ---------------------------------------------------------------- Claude settings.json hooks
@@ -154,7 +156,7 @@ function Install-Notifier {
     $src = (Resolve-Path $PSScriptRoot).Path.TrimEnd('\')
     $dst = (Resolve-Path $NotifierHome).Path.TrimEnd('\')
     if ($src -ine $dst) {
-        Stop-Watcher | Out-Null
+        Stop-Watcher -Quiet
         foreach ($f in $ProgramFiles) {
             $from = Join-Path $src $f
             if (Test-Path -LiteralPath $from) { Copy-Item -LiteralPath $from -Destination (Join-Path $dst $f) -Force }
@@ -180,7 +182,7 @@ function Install-Notifier {
     $lnk.Save()
     Write-Host "Autostart:     $StartupLink"
 
-    if ($src -ine $dst) { Stop-Watcher | Out-Null }
+    if ($src -ine $dst) { Stop-Watcher -Quiet }
     Start-Watcher
     Write-Host ''
     Write-Host 'Hooks load when a Claude Code session starts: sessions that were already open are tracked after you restart them.'
@@ -205,7 +207,7 @@ function Uninstall-Notifier {
 
 function Show-Status {
     $cfg = Get-NotifierConfig
-    $w = Get-WatcherProcesses
+    $w = @(Get-WatcherProcesses)
     Write-Host ('Watcher:   ' + $(if ($w.Count) { "running (pid $($w[0].ProcessId))" } else { 'NOT running  ->  claude-idle start' }))
     Write-Host ('Hooks:     ' + $(if (Test-HooksInstalled) { "installed in $ClaudeSettings" } else { 'NOT installed  ->  claude-idle install' }))
     Write-Host ('Reminders: first after {0} min, then every {1} min, for: {2}; give up after {3} h' -f `
